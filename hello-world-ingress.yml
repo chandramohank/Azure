@@ -25,6 +25,13 @@ spec:
             name: aks-helloworld-two
             port:
               number: 80
+      - path: /hello-world-three(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: aks-helloworld-two
+            port:
+              number: 80
       - path: /(.*)
         pathType: Prefix
         backend:
