@@ -1,0 +1,153 @@
+import azure.functions as func
+import azure.durable_functions as df
+import ijson
+import json
+import os
+from azure.storage.blob import BlobServiceClient
+from typing import List, Dict, Any
+
+# Configuration
+CHUNK_SIZE = 2000  # Records per chunk
+OUTPUT_CONTAINER = "recipe-chunks"
+CONNECTION_STRING = os.getenv("AzureWebJobsStorage")
+
+app = df.DFApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+# Orchestrator function
+@app.orchestration_trigger(context_name="context")
+def recipe_chunk_orchestrator(context):
+    # Get input (source blob details)
+    input_data = context.get_input()
+    container_name = input_data['containerName']
+    blob_name = input_data['blobName']
+    
+    # Initialize variables
+    chunk_index = 0
+    chunk_tasks = []
+    
+    # Process the JSON stream in chunks
+    chunk_results = yield context.call_activity("stream_recipe_chunks", {
+        'containerName': container_name,
+        'blobName': blob_name,
+        'chunkIndex': chunk_index
+    })
+    
+    # Process each chunk (can be done in parallel if needed)
+    for chunk_info in chunk_results:
+        chunk_tasks.append(context.call_activity("process_recipe_chunk", chunk_info))
+    
+    yield context.task_all(chunk_tasks)
+    
+    return f"Processed {len(chunk_results)} chunks with {sum(c['recordCount'] for c in chunk_results)} total recipes"
+
+# Activity to stream and chunk the recipes
+@app.activity_trigger(input_name="chunkData")
+async def stream_recipe_chunks(chunkData: dict) -> List[Dict[str, Any]]:
+    blob_service_client = BlobServiceClient.from_connection_string(CONNECTION_STRING)
+    blob_client = blob_service_client.get_blob_client(
+        container=chunkData['containerName'],
+        blob=chunkData['blobName']
+    )
+    
+    # Stream the blob content
+    download_stream = blob_client.download_blob()
+    stream = download_stream.chunks()
+    
+    # Initialize variables
+    current_chunk: List[Dict[str, Any]] = []
+    chunk_index = chunkData['chunkIndex']
+    chunk_results = []
+    in_recipes = False
+    
+    # Create async parser
+    parser = ijson.parse_coro(stream)
+    
+    async for prefix, event, value in parser:
+        # Detect when we enter the recipes array
+        if prefix == "body.recipe" and event == "start_array":
+            in_recipes = True
+            continue
+        
+        # Process individual recipe objects
+        if in_recipes and prefix.startswith("body.recipe.item"):
+            if event == "start_map":
+                current_recipe = {}
+            elif event == "end_map":
+                current_chunk.append(current_recipe)
+                
+                # When we hit CHUNK_SIZE, save the chunk
+                if len(current_chunk) >= CHUNK_SIZE:
+                    chunk_info = await save_recipe_chunk(current_chunk, chunk_index)
+                    chunk_results.append(chunk_info)
+                    current_chunk = []
+                    chunk_index += 1
+        
+        # Collect object properties
+        elif in_recipes and prefix.startswith("body.recipe.item."):
+            prop_name = prefix.split(".")[-1]
+            current_recipe[prop_name] = value
+    
+    # Save any remaining recipes in the last chunk
+    if current_chunk:
+        chunk_info = await save_recipe_chunk(current_chunk, chunk_index)
+        chunk_results.append(chunk_info)
+    
+    return chunk_results
+
+async def save_recipe_chunk(recipes: List[Dict[str, Any]], chunk_index: int) -> Dict[str, Any]:
+    """Save a chunk of recipes to blob storage"""
+    blob_service_client = BlobServiceClient.from_connection_string(CONNECTION_STRING)
+    blob_name = f"recipes_{chunk_index}.json"
+    
+    # Create container if it doesn't exist
+    container_client = blob_service_client.get_container_client(OUTPUT_CONTAINER)
+    if not await container_client.exists():
+        await container_client.create_container()
+    
+    # Upload the chunk
+    blob_client = container_client.get_blob_client(blob_name)
+    await blob_client.upload_blob(json.dumps({
+        "chunkIndex": chunk_index,
+        "recipes": recipes
+    }))
+    
+    return {
+        "chunkBlobName": blob_name,
+        "chunkIndex": chunk_index,
+        "recordCount": len(recipes),
+        "containerName": OUTPUT_CONTAINER
+    }
+
+# Activity to process individual recipe chunks
+@app.activity_trigger(input_name="chunkInfo")
+async def process_recipe_chunk(chunkInfo: dict) -> Dict[str, Any]:
+    """Process an individual recipe chunk"""
+    # Example processing:
+    # 1. Get the chunk blob
+    # 2. Transform the recipes
+    # 3. Store results elsewhere
+    
+    return {
+        "status": "processed",
+        "chunkIndex": chunkInfo['chunkIndex'],
+        "recipesProcessed": chunkInfo['recordCount'],
+        "outputLocation": f"{OUTPUT_CONTAINER}/{chunkInfo['chunkBlobName']}"
+    }
+
+# Trigger function when new recipe file arrives
+@app.blob_trigger(
+    arg_name="recipeBlob",
+    path="recipe-input/{name}",
+    connection="AzureWebJobsStorage"
+)
+@app.durable_client_input(client_name="client")
+async def recipe_blob_trigger(recipeBlob: func.InputStream, client):
+    instance_id = await client.start_new(
+        orchestration_function_name="recipe_chunk_orchestrator",
+        client_input={
+            "containerName": "recipe-input",
+            "blobName": recipeBlob.name
+        }
+    )
+    
+    return client.create_check_status_response(recipeBlob, instance_id)
